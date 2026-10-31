@@ -1,0 +1,66 @@
+# Secrets and machine-local configuration
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+acme.json
+
+# Runtime data, databases, backups, workspaces, and logs
+/data/
+/backend/data/
+/backups/
+/logs/
+/workspaces/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.log
+*.md
+
+# Go build outputs
+/panel
+/panel.exe
+/backend/panel
+/backend/panel.exe
+*.test
+coverage.out
+
+# Node dependencies and generated frontend output
+**/node_modules/
+/frontend/dist/
+/frontend/.svelte-kit/
+/frontend/.vite/
+/frontend/coverage/
+
+# Embedded frontend build output; keep the embed placeholders
+/backend/web/dist/*
+!/backend/web/dist/placeholder.txt
+!/backend/web/dist/assets/
+/backend/web/dist/assets/*
+!/backend/web/dist/assets/placeholder.txt
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.ntvs*
+*.njsproj
+*.sln

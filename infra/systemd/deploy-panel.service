@@ -1,0 +1,29 @@
+[Unit]
+Description=Deploy Panel
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy-panel
+Group=deploy-panel
+SupplementaryGroups=docker
+WorkingDirectory=/var/lib/deploy-panel
+EnvironmentFile=/etc/deploy-panel/panel.env
+ExecStart=/opt/deploy-panel/panel serve
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/deploy-panel
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
