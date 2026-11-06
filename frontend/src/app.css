@@ -37,6 +37,10 @@
 	--radius: 0.625rem;
 }
 
+.terminal-host .xterm {
+	height: 100%;
+}
+
 html[data-theme="light"] {
 	--background: oklch(0.98 0.005 285);
 	--foreground: oklch(0.22 0.02 285);
