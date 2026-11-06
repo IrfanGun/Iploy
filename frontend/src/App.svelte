@@ -1,4 +1,8 @@
 ﻿<script lang="ts">
+  import { tick } from 'svelte'
+  import { Terminal } from '@xterm/xterm'
+  import { FitAddon } from '@xterm/addon-fit'
+  import '@xterm/xterm/css/xterm.css'
   import { ArrowLeft, ArrowUpRight, Box, GitBranch, KeyRound, Moon, Plus, RefreshCw, Rocket, Server, Sun, Trash2, X } from '@lucide/svelte'
   import { Badge } from '$lib/components/ui/badge/index.js'
   import { Button } from '$lib/components/ui/button/index.js'
@@ -13,13 +17,15 @@
   import SectionCards from '$lib/components/section-cards.svelte'
   import IployLogo from '$lib/components/iploy-logo.svelte'
 
-  type Project = { id: string; name: string; repo_url: string; branch: string; domain: string; container_port: number; active_deployment_id?: string | null; container_status: string; deployment_status: string; created_at: string }
+  type Project = { id: string; vps_id: string; project_path: string; name: string; repo_url: string; branch: string; domain: string; container_port: number; active_deployment_id?: string | null; container_status: string; deployment_status: string; created_at: string }
+  type VPS = { id: string; name: string; host: string; port: number; username: string; host_fingerprint: string; status: string; created_at: string }
   type Deployment = { id: string; kind: string; status: string; requested_ref: string; commit_sha?: string | null; created_at: string; error_message?: string | null }
 
   let csrf = ''
   let theme: 'light' | 'dark' = localStorage.getItem('deploy-panel-theme') === 'light' ? 'light' : 'dark'
   let signedIn = false
   let projects: Project[] = []
+  let vpsList: VPS[] = []
   let deploysToday = 0
   let apiOnline = false
   let selected: Project | null = null
@@ -36,8 +42,16 @@
   let username = ''
   let password = ''
   let showForm = false
+  let showVPSPage = false
+  let showVPSForm = false
   let busy = false
-  let form = { name: '', repo_url: '', branch: 'main', dockerfile_path: 'Dockerfile', build_context: '.', domain: '', container_port: 3000, health_path: '/health', health_timeout_seconds: 60, runtime_memory_mb: 512, runtime_cpu_limit: 1 }
+  let terminalSocket: WebSocket | null = null
+  let terminalStatus: 'disconnected' | 'connecting' | 'connected' = 'disconnected'
+  let terminal: Terminal | null = null
+  let terminalHost: HTMLDivElement | undefined
+  let terminalResizeObserver: ResizeObserver | null = null
+  let vpsForm = { name: '', host: '', port: 22, username: 'ubuntu', password: '' }
+  let form = { vps_id: '', name: '', project_path: '' }
 
   function applyTheme(value: 'light' | 'dark') {
     theme = value
@@ -58,6 +72,7 @@
     loading = true
     try {
       projects = await request('/api/projects')
+      vpsList = await request('/api/vps')
       error = ''
       apiOnline = true
       const histories = await Promise.all(projects.map((p) => request('/api/projects/' + p.id + '/deployments').catch(() => [])))
@@ -87,6 +102,7 @@
     finally { busy = false }
   }
   async function logout() {
+    closeTerminal()
     try { await request('/api/auth/logout', 'POST', {}) } catch {}
     signedIn = false; projects = []; selected = null; csrf = ''
   }
@@ -94,10 +110,63 @@
     e.preventDefault(); busy = true; error = ''
     try {
       await request('/api/projects', 'POST', form)
-      showForm = false; form = { ...form, name: '', repo_url: '', domain: '' }
+      showForm = false; showVPSPage = false; form = { ...form, name: '', project_path: '' }
       await refresh()
     } catch (e) { error = e instanceof Error ? e.message : 'Project gagal disimpan' }
     finally { busy = false }
+  }
+  async function createVPS(e: SubmitEvent) {
+    e.preventDefault(); busy = true; error = ''
+    try {
+      const created: VPS = await request('/api/vps', 'POST', vpsForm)
+      vpsList = [created, ...vpsList]
+      vpsForm = { name: '', host: '', port: 22, username: 'ubuntu', password: '' }
+      showVPSForm = false; showVPSPage = false; showForm = true
+      form = { ...form, vps_id: created.id }
+    } catch (e) { error = e instanceof Error ? e.message : 'VPS gagal disimpan' }
+    finally { busy = false }
+  }
+  async function testVPS(id: string) {
+    busy = true
+    try { await request('/api/vps/' + id + '/test', 'POST', {}); vpsList = vpsList.map(v => v.id === id ? { ...v, status: 'connected' } : v); error = '' }
+    catch (e) { error = e instanceof Error ? e.message : 'Koneksi SSH gagal'; vpsList = vpsList.map(v => v.id === id ? { ...v, status: 'disconnected' } : v) }
+    finally { busy = false }
+  }
+  function closeTerminal() {
+    terminalSocket?.close()
+    terminalSocket = null
+    terminalStatus = 'disconnected'
+    terminalResizeObserver?.disconnect()
+    terminalResizeObserver = null
+    terminal?.dispose()
+    terminal = null
+  }
+  async function connectTerminal() {
+    const project = selected
+    if (!project || !project.project_path || terminalSocket) return
+    terminalStatus = 'connecting'
+    await tick()
+    const host = terminalHost
+    if (!host || selected?.id !== project.id) { terminalStatus = 'disconnected'; return }
+    terminalResizeObserver?.disconnect()
+    terminal?.dispose()
+    const activeTerminal = new Terminal({ cursorBlink: true, convertEol: true, fontSize: 13, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', theme: { background: '#09090b', foreground: '#d4d4d8', cursor: '#fafafa' } })
+    const fit = new FitAddon()
+    terminal = activeTerminal
+    activeTerminal.loadAddon(fit)
+    activeTerminal.open(host)
+    fit.fit()
+    const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
+    const socket = new WebSocket(`${scheme}://${location.host}/api/projects/${project.id}/terminal`, ['iploy-terminal', `csrf.${csrf}`])
+    terminalSocket = socket
+    terminalResizeObserver = new ResizeObserver(() => fit.fit())
+    terminalResizeObserver.observe(host)
+    activeTerminal.onData((data) => { if (socket.readyState === WebSocket.OPEN) socket.send(data) })
+    activeTerminal.onResize(({ cols, rows }) => { if (socket.readyState === WebSocket.OPEN) socket.send(`\u0000resize:${cols}:${rows}`) })
+    socket.onopen = () => { terminalStatus = 'connected'; activeTerminal.write(`\r\nConnected · ${project.project_path}\r\n`); socket.send(`\u0000resize:${activeTerminal.cols}:${activeTerminal.rows}`) }
+    socket.onmessage = (event) => activeTerminal.write(String(event.data))
+    socket.onerror = () => activeTerminal.write('\r\nTerminal connection error.\r\n')
+    socket.onclose = (event) => { if (terminalSocket === socket) { terminalSocket = null; terminalStatus = 'disconnected'; activeTerminal.write(event.reason ? `\r\nSSH session closed: ${event.reason}\r\n` : '\r\nSSH session closed.\r\n') } }
   }
   async function deploy() {
     if (!selected) return
@@ -107,6 +176,7 @@
     finally { busy = false }
   }
   async function openProject(project: Project) {
+    closeTerminal()
     selected = project; activeTab = 'Overview'
     try {
       deployments = await request('/api/projects/' + project.id + '/deployments')
@@ -116,6 +186,8 @@
   }
   async function changeTab(tab: string) {
     activeTab = tab
+    if (tab === 'Terminal') { connectTerminal(); return }
+    closeTerminal()
     if (!selected) return
     try {
       if (tab === 'Deployments') deployments = await request('/api/projects/' + selected.id + '/deployments')
@@ -160,6 +232,7 @@
     } catch (e) { error = e instanceof Error ? e.message : 'Konfigurasi volume gagal diubah' }
   }
   function statusLabel(project: Project) {
+    if (project.container_status === 'connected') return 'Terhubung'
     if (project.container_status === 'running') return 'Berjalan'
     if (project.container_status === 'stopped') return 'Berhenti'
     if (project.container_status === 'unhealthy') return 'Tidak sehat'
@@ -202,8 +275,9 @@
       selectedId={selected?.id ?? null}
       {username}
       onOpenProject={openProject}
-      onHome={() => { selected = null; showForm = false }}
-      onCreateProject={() => { selected = null; showForm = true }}
+      onHome={() => { closeTerminal(); selected = null; showForm = false; showVPSPage = false; showVPSForm = false }}
+      onCreateProject={() => { closeTerminal(); selected = null; showVPSPage = false; showVPSForm = false; showForm = true }}
+      onVPS={() => { closeTerminal(); selected = null; showForm = false; showVPSPage = true; showVPSForm = false }}
       onLogout={logout}
     />
     <Sidebar.Inset>
@@ -213,7 +287,7 @@
           <Sidebar.Trigger class="-ms-1" />
           <Separator orientation="vertical" class="mx-1 h-4" />
           <span class="hidden text-muted-foreground sm:inline">Workspace</span><span class="hidden text-muted-foreground sm:inline">/</span>
-          <span class="truncate font-medium">{selected ? selected.name : showForm ? 'Project baru' : 'Overview'}</span>
+          <span class="truncate font-medium">{selected ? selected.name : showVPSPage ? 'VPS' : showForm ? 'Project baru' : 'Overview'}</span>
         </div>
         <div class="flex shrink-0 items-center gap-2">
           <Badge variant={apiOnline ? 'secondary' : 'outline'} class="gap-1.5">
@@ -239,22 +313,31 @@
             <div class="min-w-0 space-y-1">
               <p class="text-xs font-medium uppercase tracking-wider text-muted-foreground">Project Â· {selected.id.slice(0, 8)}</p>
               <h1 class="truncate text-2xl font-semibold tracking-tight sm:text-3xl">{selected.name}</h1>
-              <p class="truncate text-sm text-muted-foreground">{selected.domain} Â· {selected.repo_url}</p>
+              <p class="truncate font-mono text-sm text-muted-foreground">{selected.project_path || `${selected.domain} · ${selected.repo_url}`}</p>
             </div>
             <div class="flex shrink-0 gap-2">
-              <Button variant="outline" onclick={() => { selected = null; activeTab = 'Overview' }}><ArrowLeft class="size-4" /> Semua project</Button>
-              <Button disabled={busy} onclick={deploy}><Rocket class="size-4" /> Deploy</Button>
+              <Button variant="outline" onclick={() => { closeTerminal(); selected = null; activeTab = 'Overview' }}><ArrowLeft class="size-4" /> Semua project</Button>
+              {#if !selected.project_path}<Button disabled={busy} onclick={deploy}><Rocket class="size-4" /> Deploy</Button>{/if}
             </div>
           </div>
           <Tabs.Root bind:value={activeTab} class="w-full">
             <Tabs.List variant="line" class="w-full justify-start overflow-x-auto">
-              {#each ['Overview', 'Deployments', 'Environment', 'Storage', 'Settings'] as tab}
-                <Tabs.Trigger value={tab} onclick={() => changeTab(tab)}>{tab}</Tabs.Trigger>
-              {/each}
+              {#if selected.project_path}{#each ['Overview', 'Terminal'] as tab}<Tabs.Trigger value={tab} onclick={() => changeTab(tab)}>{tab === 'Overview' ? 'Folder VPS' : tab}</Tabs.Trigger>{/each}{:else}{#each ['Overview', 'Deployments', 'Environment', 'Storage', 'Settings'] as tab}<Tabs.Trigger value={tab} onclick={() => changeTab(tab)}>{tab}</Tabs.Trigger>{/each}{/if}
             </Tabs.List>
           </Tabs.Root>
 
-          {#if activeTab === 'Environment'}
+          {#if activeTab === 'Terminal' && selected.project_path}
+            <Card.Root>
+              <Card.Header class="flex-row items-start justify-between gap-3">
+                <div class="space-y-1"><Card.Title>Terminal VPS</Card.Title><Card.Description>SSH sebagai {vpsList.find(v => v.id === selected?.vps_id)?.username || 'user VPS'} · mulai di {selected.project_path}</Card.Description></div>
+                <div class="flex items-center gap-2"><Badge variant={terminalStatus === 'connected' ? 'default' : 'secondary'}>{terminalStatus === 'connected' ? 'Terhubung' : terminalStatus === 'connecting' ? 'Menghubungkan' : 'Terputus'}</Badge><Button variant="outline" size="sm" disabled={terminalStatus === 'connecting'} onclick={terminalStatus === 'connected' ? closeTerminal : connectTerminal}>{terminalStatus === 'connected' ? 'Putuskan' : 'Hubungkan'}</Button></div>
+              </Card.Header>
+              <Card.Content class="space-y-3">
+                <div bind:this={terminalHost} class="terminal-host h-[55vh] min-h-72 overflow-hidden rounded-md border bg-[#09090b] p-2"></div>
+                <p class="text-xs text-muted-foreground">Perintah dijalankan di VPS dengan izin akun SSH. Akses filesystem mengikuti izin akun tersebut.</p>
+              </Card.Content>
+            </Card.Root>
+          {:else if activeTab === 'Environment'}
             <Card.Root>
               <Card.Header><Card.Title>Environment variables</Card.Title><Card.Description>Secret dienkripsi saat tersimpan. Nilainya tidak ditampilkan kembali.</Card.Description></Card.Header>
               <Card.Content class="space-y-5">
@@ -301,7 +384,7 @@
             <Card.Root>
               <Card.Header class="flex-row items-center justify-between space-y-0">
                 <div class="space-y-1"><Card.Title>Riwayat deployment</Card.Title><Card.Description>Build dan rilis project ini.</Card.Description></div>
-                <Button size="sm" disabled={busy} onclick={deploy}><Rocket class="size-4" /> Deploy</Button>
+                {#if !selected.project_path}<Button size="sm" disabled={busy} onclick={deploy}><Rocket class="size-4" /> Deploy</Button>{/if}
               </Card.Header>
               <Card.Content>
                 {#if deployments.length === 0}
@@ -339,9 +422,9 @@
               <Card.Root>
                 <Card.Header class="flex-row items-start justify-between space-y-0">
                   <div class="space-y-2">
-                    <Card.Description class="font-medium uppercase tracking-wide">Status aplikasi</Card.Description>
-                    <Card.Title class="break-all text-xl">{selected.domain}</Card.Title>
-                    <Card.Description class="flex items-center gap-2"><GitBranch class="size-4" /> {selected.branch} Â· Port {selected.container_port}</Card.Description>
+                    <Card.Description class="font-medium uppercase tracking-wide">{selected.project_path ? 'Folder project' : 'Status aplikasi'}</Card.Description>
+                    <Card.Title class="break-all font-mono text-xl">{selected.project_path || selected.domain}</Card.Title>
+                    <Card.Description class="flex items-center gap-2">{#if selected.project_path}<Server class="size-4" />Folder tersedia melalui SSH{:else}<GitBranch class="size-4" /> {selected.branch} Â· Port {selected.container_port}{/if}</Card.Description>
                   </div>
                   <Badge variant={selected.container_status === 'running' ? 'default' : selected.container_status === 'unhealthy' ? 'destructive' : 'secondary'}>{statusLabel(selected)}</Badge>
                 </Card.Header>
@@ -375,27 +458,53 @@
               </Card.Content>
             </Card.Root>
           {/if}
+        {:else if showVPSPage}
+          <div class="flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
+            <div class="space-y-1"><p class="text-xs font-medium uppercase tracking-wider text-muted-foreground">Workspace · Infrastruktur</p><h1 class="text-2xl font-semibold tracking-tight sm:text-3xl">VPS</h1><p class="text-sm text-muted-foreground">Hubungkan server lewat SSH sebelum menyiapkan project.</p></div>
+            <div class="flex gap-2"><Button variant="outline" onclick={() => { showVPSPage = false }}><ArrowLeft class="size-4" /> Overview</Button><Button onclick={() => showVPSForm = true}><Plus class="size-4" /> Tambah VPS</Button></div>
+          </div>
+          {#if showVPSForm}
+            <Card.Root>
+              <form onsubmit={createVPS}>
+                <Card.Header><Card.Title>Koneksi SSH</Card.Title><Card.Description>Masuk menggunakan akun Ubuntu. Password dienkripsi; fingerprint server akan dipin otomatis saat koneksi pertama.</Card.Description></Card.Header>
+                <Card.Content class="grid gap-5 sm:grid-cols-2">
+                  <div class="space-y-2"><Label for="vps-name">Nama VPS</Label><Input id="vps-name" bind:value={vpsForm.name} placeholder="Production Jakarta" required /></div>
+                  <div class="space-y-2"><Label for="vps-host">IP atau hostname</Label><Input id="vps-host" bind:value={vpsForm.host} placeholder="203.0.113.10" required /></div>
+                  <div class="space-y-2"><Label for="vps-port">Port SSH</Label><Input id="vps-port" type="number" min="1" max="65535" bind:value={vpsForm.port} required /></div>
+                  <div class="space-y-2"><Label for="vps-user">Username SSH</Label><Input id="vps-user" bind:value={vpsForm.username} autocomplete="username" placeholder="ubuntu" required /></div>
+                  <div class="space-y-2"><Label for="vps-password">Password SSH</Label><Input id="vps-password" type="password" bind:value={vpsForm.password} autocomplete="new-password" required /></div>
+                  <p class="text-xs text-muted-foreground sm:col-span-2">Saat koneksi pertama, panel menyimpan fingerprint server dan membandingkannya pada koneksi berikutnya. Simpan VPS akan mencoba login SSH lebih dulu.</p>
+                </Card.Content>
+                <Card.Footer class="justify-between"><Button type="button" variant="outline" onclick={() => showVPSForm = false}>Batal</Button><Button type="submit" disabled={busy}>{busy ? 'Menguji SSH…' : 'Uji koneksi & simpan'}<ArrowUpRight class="size-4" /></Button></Card.Footer>
+              </form>
+            </Card.Root>
+          {/if}
+          <section class="space-y-4">
+            <div class="space-y-1"><h2 class="text-lg font-semibold">Server terdaftar</h2><p class="text-sm text-muted-foreground">Kredensial tidak pernah dikirim kembali ke browser.</p></div>
+            {#if vpsList.length === 0}
+              <Card.Root><Card.Content class="py-10 text-center text-sm text-muted-foreground">Belum ada VPS. Tambahkan server untuk memulai setup project.</Card.Content></Card.Root>
+            {:else}
+              <div class="grid gap-3 md:grid-cols-2">
+                {#each vpsList as vps (vps.id)}
+                  <Card.Root><Card.Header class="flex-row items-start justify-between space-y-0"><div class="space-y-1"><Card.Title>{vps.name}</Card.Title><Card.Description>{vps.username}@{vps.host}:{vps.port}</Card.Description></div><Badge variant={vps.status === 'connected' ? 'default' : 'destructive'}>{vps.status === 'connected' ? 'Terhubung' : 'Terputus'}</Badge></Card.Header><Card.Content class="flex flex-wrap items-center justify-between gap-3"><code class="break-all text-xs text-muted-foreground">{vps.host_fingerprint}</code><Button variant="outline" size="sm" disabled={busy} onclick={() => testVPS(vps.id)}><RefreshCw class="size-4" /> Tes koneksi</Button></Card.Content></Card.Root>
+                {/each}
+              </div>
+            {/if}
+          </section>
         {:else if showForm}
           <div class="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-            <div class="space-y-1"><p class="text-xs font-medium uppercase tracking-wider text-muted-foreground">Workspace Â· Project baru</p><h1 class="text-2xl font-semibold tracking-tight sm:text-3xl">Tambah project</h1><p class="text-sm text-muted-foreground">Hubungkan repository dan tentukan runtime.</p></div>
+            <div class="space-y-1"><p class="text-xs font-medium uppercase tracking-wider text-muted-foreground">Workspace Â· Project yang sudah ada</p><h1 class="text-2xl font-semibold tracking-tight sm:text-3xl">Hubungkan project</h1><p class="text-sm text-muted-foreground">Project sudah disiapkan di VPS; panel hanya memeriksa akses SSH ke foldernya.</p></div>
             <Button variant="outline" onclick={() => showForm = false}><X class="size-4" /> Batal</Button>
           </div>
           <Card.Root>
             <form onsubmit={createProject}>
-              <Card.Header><Card.Title>Source code</Card.Title><Card.Description>Repository menggunakan URL HTTPS.</Card.Description></Card.Header>
+              <Card.Header><Card.Title>Folder project di VPS</Card.Title><Card.Description>Nama project bebas kamu tentukan. Masukkan path folder yang sudah ada di VPS; panel akan memeriksanya lewat SSH.</Card.Description></Card.Header>
               <Card.Content class="grid gap-5 sm:grid-cols-2">
-                <div class="space-y-2"><Label for="project-name">Nama project</Label><Input id="project-name" bind:value={form.name} placeholder="my-app" required /></div>
-                <div class="space-y-2"><Label for="project-repo">Repository URL</Label><Input id="project-repo" type="url" bind:value={form.repo_url} placeholder="https://github.com/you/app" required /></div>
-                <div class="space-y-2"><Label for="project-branch">Branch</Label><Input id="project-branch" bind:value={form.branch} required /></div>
-                <div class="space-y-2"><Label for="project-dockerfile">Dockerfile path</Label><Input id="project-dockerfile" bind:value={form.dockerfile_path} required /></div>
-                <div class="space-y-2"><Label for="project-context">Build context</Label><Input id="project-context" bind:value={form.build_context} required /></div>
-                <Separator class="sm:col-span-2" />
-                <div class="space-y-2"><Label for="project-domain">Domain</Label><Input id="project-domain" bind:value={form.domain} placeholder="app.example.com" required /></div>
-                <div class="space-y-2"><Label for="project-port">Container port</Label><Input id="project-port" type="number" min="1" max="65535" bind:value={form.container_port} required /></div>
-                <div class="space-y-2"><Label for="project-health">Health check path</Label><Input id="project-health" bind:value={form.health_path} required /></div>
-                <div class="space-y-2"><Label for="project-memory">Memory limit (MB)</Label><Input id="project-memory" type="number" bind:value={form.runtime_memory_mb} /></div>
+                <div class="space-y-2 sm:col-span-2"><Label for="project-vps">Target VPS</Label><select id="project-vps" class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm" bind:value={form.vps_id} required><option value="" disabled>Pilih VPS yang sudah terhubung</option>{#each vpsList as vps}<option value={vps.id}>{vps.name} · {vps.host}</option>{/each}</select></div>
+                <div class="space-y-2"><Label for="project-name">Nama project</Label><Input id="project-name" bind:value={form.name} placeholder="Nama project" required /></div>
+                <div class="space-y-2 sm:col-span-2"><Label for="project-path">Path folder project di VPS</Label><Input id="project-path" bind:value={form.project_path} placeholder="/home/ubuntu/finance-app atau finance-app" required pattern="/?[A-Za-z0-9._/-]+" /></div>
               </Card.Content>
-              <Card.Footer class="justify-between"><p class="text-xs text-muted-foreground">Pengaturan bisa diperbarui nanti.</p><Button type="submit" disabled={busy}>{busy ? 'Menyimpanâ€¦' : 'Buat project'}<Plus class="size-4" /></Button></Card.Footer>
+              <Card.Footer class="justify-between"><p class="text-xs text-muted-foreground">Tidak ada folder atau layanan yang diubah di VPS.</p><Button type="submit" disabled={busy}>{busy ? 'Mengecek folder…' : 'Cek folder & simpan'}<Plus class="size-4" /></Button></Card.Footer>
             </form>
           </Card.Root>
         {:else}
@@ -430,17 +539,17 @@
                 <Card.Content class="px-0">
                   <div class="overflow-x-auto px-4">
                     <Table.Root>
-                      <Table.Header><Table.Row><Table.Head>Nama</Table.Head><Table.Head>Branch</Table.Head><Table.Head>Status</Table.Head><Table.Head class="text-right">Deployment</Table.Head></Table.Row></Table.Header>
+                      <Table.Header><Table.Row><Table.Head>Nama</Table.Head><Table.Head>Folder VPS</Table.Head><Table.Head>Status</Table.Head><Table.Head class="text-right">Deployment</Table.Head></Table.Row></Table.Header>
                       <Table.Body>
                         {#each projects as project (project.id)}
                           <Table.Row>
                             <Table.Cell>
                               <Button variant="link" class="h-auto justify-start p-0 font-medium" onclick={() => openProject(project)}>{project.name}<ArrowUpRight class="size-3.5" /></Button>
-                              <p class="mt-1 text-xs text-muted-foreground">{project.domain}</p>
+                              <p class="mt-1 font-mono text-xs text-muted-foreground">{project.project_path || project.domain}</p>
                             </Table.Cell>
-                            <Table.Cell><span class="inline-flex items-center gap-1.5 font-mono text-xs"><GitBranch class="size-3.5" />{project.branch}</span></Table.Cell>
+                            <Table.Cell><span class="inline-flex items-center gap-1.5 font-mono text-xs">{project.project_path || project.branch}</span></Table.Cell>
                             <Table.Cell><Badge variant={project.container_status === 'running' ? 'default' : project.container_status === 'unhealthy' ? 'destructive' : 'secondary'}>{statusLabel(project)}</Badge></Table.Cell>
-                            <Table.Cell class="text-right"><Badge variant="outline" class="capitalize">{project.deployment_status === 'never' ? 'Belum ada' : project.deployment_status}</Badge></Table.Cell>
+                            <Table.Cell class="text-right"><Badge variant="outline">{project.deployment_status === 'never' ? 'Belum ada' : project.deployment_status === 'linked' ? 'Terhubung ke VPS' : project.deployment_status}</Badge></Table.Cell>
                           </Table.Row>
                         {/each}
                       </Table.Body>

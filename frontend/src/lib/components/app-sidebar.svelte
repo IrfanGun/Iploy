@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Activity, FolderGit2, LogOut, Plus } from "@lucide/svelte";
+	import { Activity, FolderGit2, LogOut, Plus, Server } from "@lucide/svelte";
 	import { Badge } from "$lib/components/ui/badge/index.js";
 	import { Button } from "$lib/components/ui/button/index.js";
 	import * as Sidebar from "$lib/components/ui/sidebar/index.js";
@@ -13,6 +13,7 @@
 		onOpenProject,
 		onHome,
 		onCreateProject,
+		onVPS,
 		onLogout,
 	}: {
 		projects: Project[];
@@ -21,6 +22,7 @@
 		onOpenProject: (project: Project) => void;
 		onHome: () => void;
 		onCreateProject: () => void;
+		onVPS: () => void;
 		onLogout: () => void;
 	} = $props();
 </script>
@@ -39,6 +41,16 @@
 						<Sidebar.MenuButton isActive={!selectedId} tooltipContent="Overview" onclick={onHome}>
 							<Activity /><span>Overview</span>
 						</Sidebar.MenuButton>
+					</Sidebar.MenuItem>
+				</Sidebar.Menu>
+			</Sidebar.GroupContent>
+		</Sidebar.Group>
+		<Sidebar.Group>
+			<Sidebar.GroupLabel>Infrastruktur</Sidebar.GroupLabel>
+			<Sidebar.GroupContent>
+				<Sidebar.Menu>
+					<Sidebar.MenuItem>
+						<Sidebar.MenuButton tooltipContent="VPS" onclick={onVPS}><Server /><span>VPS</span></Sidebar.MenuButton>
 					</Sidebar.MenuItem>
 				</Sidebar.Menu>
 			</Sidebar.GroupContent>

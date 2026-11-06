@@ -3,6 +3,7 @@ go 1.24.5
 module deploy-panel/backend
 
 require (
+	github.com/coder/websocket v1.8.13
 	golang.org/x/crypto v0.40.0
 	golang.org/x/term v0.33.0
 	modernc.org/sqlite v1.38.2

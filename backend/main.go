@@ -26,10 +26,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	panelweb "deploy-panel/backend/web"
+	"github.com/coder/websocket"
 	"golang.org/x/crypto/argon2"
+	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 	_ "modernc.org/sqlite"
 )
@@ -49,6 +52,8 @@ type App struct {
 }
 type Project struct {
 	ID               string  `json:"id"`
+	VPSID            string  `json:"vps_id"`
+	ProjectPath      string  `json:"project_path"`
 	Name             string  `json:"name"`
 	RepoURL          string  `json:"repo_url"`
 	Branch           string  `json:"branch"`
@@ -64,6 +69,16 @@ type Project struct {
 	ContainerStatus  string  `json:"container_status"`
 	DeploymentStatus string  `json:"deployment_status"`
 	Created          string  `json:"created_at"`
+}
+type VPS struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	Username    string `json:"username"`
+	Fingerprint string `json:"host_fingerprint"`
+	Status      string `json:"status"`
+	Created     string `json:"created_at"`
 }
 type apiError struct {
 	Error struct {
@@ -205,11 +220,11 @@ func newApp(c Config) (*App, error) {
 		return nil, errors.New("PANEL_MASTER_KEY must contain exactly 32 bytes")
 	}
 	if len(k) == 0 {
-		k = make([]byte, 32)
-		if _, e = rand.Read(k); e != nil {
+		k, e = loadOrCreateDevelopmentKey(c.DataDir)
+		if e != nil {
 			return nil, e
 		}
-		slog.Warn("using ephemeral development encryption key; secrets will not survive restart")
+		slog.Warn("using local development encryption key from data directory; keep it with the local database")
 	}
 	d := openDB(c)
 	if e = migrate(d); e != nil {
@@ -219,18 +234,104 @@ func newApp(c Config) (*App, error) {
 	a.routes()
 	return a, nil
 }
+func loadOrCreateDevelopmentKey(dataDir string) ([]byte, error) {
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(dataDir, "development.key")
+	key, err := os.ReadFile(path)
+	if err == nil {
+		if len(key) != 32 {
+			return nil, errors.New("development key file must contain exactly 32 bytes")
+		}
+		return key, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	key = make([]byte, 32)
+	if _, err = rand.Read(key); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if errors.Is(err, os.ErrExist) {
+		key, err = os.ReadFile(path)
+		if err == nil && len(key) != 32 {
+			err = errors.New("development key file must contain exactly 32 bytes")
+		}
+		return key, err
+	}
+	if err != nil {
+		return nil, err
+	}
+	if _, err = f.Write(key); err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		_ = os.Remove(path)
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return key, nil
+}
 func migrate(d *sql.DB) error {
 	_, e := d.Exec(`PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS vps(id TEXT PRIMARY KEY,name TEXT NOT NULL,host TEXT NOT NULL,port INTEGER NOT NULL,username TEXT NOT NULL,host_fingerprint TEXT NOT NULL,password_encrypted BLOB NOT NULL,password_nonce BLOB NOT NULL,status TEXT NOT NULL DEFAULT 'connected',created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS admins(id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash BLOB NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL, admin_id TEXT NOT NULL REFERENCES admins(id) ON DELETE CASCADE, csrf_hash TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,repo_url TEXT NOT NULL,branch TEXT NOT NULL,dockerfile_path TEXT NOT NULL,build_context TEXT NOT NULL,domain TEXT UNIQUE NOT NULL,container_port INTEGER NOT NULL,health_path TEXT NOT NULL,health_timeout_seconds INTEGER NOT NULL,runtime_memory_mb INTEGER NOT NULL,runtime_cpu_limit REAL NOT NULL,active_deployment_id TEXT,container_status TEXT NOT NULL DEFAULT 'missing',deployment_status TEXT NOT NULL DEFAULT 'never',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,deleted_at TEXT);
+CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,repo_url TEXT NOT NULL,branch TEXT NOT NULL,dockerfile_path TEXT NOT NULL,build_context TEXT NOT NULL,domain TEXT UNIQUE NOT NULL,container_port INTEGER NOT NULL,health_path TEXT NOT NULL,health_timeout_seconds INTEGER NOT NULL,runtime_memory_mb INTEGER NOT NULL,runtime_cpu_limit REAL NOT NULL,active_deployment_id TEXT,container_status TEXT NOT NULL DEFAULT 'missing',deployment_status TEXT NOT NULL DEFAULT 'never',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,deleted_at TEXT,project_path TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS project_env(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,key TEXT NOT NULL,encrypted_value BLOB NOT NULL,nonce BLOB NOT NULL,key_version INTEGER NOT NULL DEFAULT 1,updated_at TEXT NOT NULL,UNIQUE(project_id,key));
 CREATE TABLE IF NOT EXISTS project_volumes(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,docker_volume_name TEXT NOT NULL,mount_target TEXT NOT NULL,UNIQUE(project_id,mount_target));
 CREATE TABLE IF NOT EXISTS deployments(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),kind TEXT NOT NULL,source_deployment_id TEXT,status TEXT NOT NULL,requested_ref TEXT NOT NULL,commit_sha TEXT,image_tag TEXT,image_id TEXT,container_id TEXT,previous_deployment_id TEXT,config_snapshot_encrypted BLOB,log_path TEXT,error_code TEXT,error_message TEXT,created_at TEXT NOT NULL,started_at TEXT,finished_at TEXT);
 CREATE INDEX IF NOT EXISTS deployments_project_created ON deployments(project_id,created_at DESC);
 CREATE TABLE IF NOT EXISTS queue(id INTEGER PRIMARY KEY AUTOINCREMENT,deployment_id TEXT UNIQUE NOT NULL REFERENCES deployments(id),status TEXT NOT NULL DEFAULT 'queued',created_at TEXT NOT NULL);
 INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,datetime('now'));`)
+	if e != nil {
+		return e
+	}
+	rows, e := d.Query("PRAGMA table_info(projects)")
+	if e != nil {
+		return e
+	}
+	hasVPS := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var def any
+		if rows.Scan(&cid, &name, &typ, &notnull, &def, &pk) == nil && name == "vps_id" {
+			hasVPS = true
+		}
+	}
+	rows.Close()
+	if !hasVPS {
+		_, e = d.Exec("ALTER TABLE projects ADD COLUMN vps_id TEXT REFERENCES vps(id)")
+	}
+	if e != nil {
+		return e
+	}
+	rows, e = d.Query("PRAGMA table_info(projects)")
+	if e != nil {
+		return e
+	}
+	hasPath := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var def any
+		if rows.Scan(&cid, &name, &typ, &notnull, &def, &pk) == nil && name == "project_path" {
+			hasPath = true
+		}
+	}
+	rows.Close()
+	if !hasPath {
+		_, e = d.Exec("ALTER TABLE projects ADD COLUMN project_path TEXT NOT NULL DEFAULT ''")
+	}
 	return e
 }
 func createAdmin(db *sql.DB) error {
@@ -289,6 +390,9 @@ func (a *App) routes() {
 	a.mux.HandleFunc("POST /api/auth/logout", a.auth(a.logout))
 	a.mux.HandleFunc("GET /api/auth/me", a.auth(a.me))
 	a.mux.HandleFunc("GET /api/projects", a.auth(a.projects))
+	a.mux.HandleFunc("GET /api/vps", a.auth(a.vps))
+	a.mux.HandleFunc("POST /api/vps", a.auth(a.vps))
+	a.mux.HandleFunc("POST /api/vps/{id}/test", a.auth(a.testVPS))
 	a.mux.HandleFunc("POST /api/projects", a.auth(a.projects))
 	a.mux.HandleFunc("GET /api/projects/{id}", a.auth(a.project))
 	a.mux.HandleFunc("PATCH /api/projects/{id}", a.auth(a.project))
@@ -300,6 +404,7 @@ func (a *App) routes() {
 	a.mux.HandleFunc("PUT /api/projects/{id}/volumes", a.auth(a.volumes))
 	a.mux.HandleFunc("GET /api/projects/{id}/deployments", a.auth(a.deployments))
 	a.mux.HandleFunc("POST /api/projects/{id}/deployments", a.auth(a.deployments))
+	a.mux.HandleFunc("GET /api/projects/{id}/terminal", a.auth(a.terminal))
 	a.mux.HandleFunc("GET /api/deployments/{id}", a.auth(a.deployment))
 	a.mux.HandleFunc("GET /api/deployments/{id}/logs", a.auth(a.deployment))
 	a.mux.HandleFunc("/", a.static)
@@ -455,9 +560,320 @@ func validRepo(s string) bool {
 func validDomain(s string) bool {
 	return len(s) < 254 && regexp.MustCompile(`^(?i)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$`).MatchString(s)
 }
+func validHost(s string) bool {
+	if net.ParseIP(s) != nil {
+		return true
+	}
+	return len(s) < 254 && regexp.MustCompile(`^(?i)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$`).MatchString(s)
+}
+func safeVPSProjectPath(s string) bool {
+	if len(s) == 0 || len(s) > 512 || strings.Contains(s, "//") || strings.Contains(s, "\\") || !regexp.MustCompile(`^/?[A-Za-z0-9._/-]+$`).MatchString(s) {
+		return false
+	}
+	for _, part := range strings.Split(s, "/") {
+		if part == ".." || part == "." {
+			return false
+		}
+	}
+	return true
+}
+func sshLogin(host string, port int, username, password, fingerprint string) (string, error) {
+	client, seenFingerprint, err := sshConnect(host, port, username, password, fingerprint)
+	if err != nil {
+		return "", err
+	}
+	return seenFingerprint, client.Close()
+}
+func sshConnect(host string, port int, username, password, fingerprint string) (*ssh.Client, string, error) {
+	if !validHost(host) || port < 1 || port > 65535 || username == "" || len(username) > 128 || password == "" || len(password) > 4096 || (fingerprint != "" && !regexp.MustCompile(`^SHA256:[A-Za-z0-9+/]{20,}={0,2}$`).MatchString(fingerprint)) {
+		return nil, "", errors.New("invalid SSH connection details")
+	}
+	address := net.JoinHostPort(host, strconv.Itoa(port))
+	dialer := net.Dialer{Timeout: 8 * time.Second}
+	conn, err := dialer.Dial("tcp", address)
+	if err != nil {
+		return nil, "", err
+	}
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	seenFingerprint := ""
+	config := &ssh.ClientConfig{User: username, Auth: []ssh.AuthMethod{ssh.Password(password)}, HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
+		seenFingerprint = ssh.FingerprintSHA256(key)
+		if fingerprint != "" && seenFingerprint != fingerprint {
+			return errors.New("SSH host fingerprint mismatch")
+		}
+		return nil
+	}, Timeout: 8 * time.Second}
+	clientConn, chans, reqs, err := ssh.NewClientConn(conn, address, config)
+	if err != nil {
+		conn.Close()
+		return nil, "", err
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return ssh.NewClient(clientConn, chans, reqs), seenFingerprint, nil
+}
+func (a *App) checkVPSDirectory(vpsID, projectPath string) error {
+	var host, username, fingerprint string
+	var port int
+	var ciphertext, nonce []byte
+	if err := a.db.QueryRow("SELECT host,port,username,host_fingerprint,password_encrypted,password_nonce FROM vps WHERE id=?", vpsID).Scan(&host, &port, &username, &fingerprint, &ciphertext, &nonce); err != nil {
+		return err
+	}
+	block, err := aes.NewCipher(a.key)
+	if err != nil {
+		return err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
+	password, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return err
+	}
+	client, _, err := sshConnect(host, port, username, string(password), fingerprint)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	session, err := client.NewSession()
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+	return session.Run(remoteProjectPrefix(projectPath) + "pwd")
+}
+func remoteProjectPrefix(projectPath string) string {
+	quotedPath := "'" + strings.ReplaceAll(projectPath, "'", "'\\''") + "'"
+	if strings.HasPrefix(projectPath, "/") {
+		return "cd " + quotedPath + " || exit; "
+	}
+	return "case \"$PWD/\" in *'/" + projectPath + "/') : ;; *) cd " + quotedPath + " || exit ;; esac; "
+}
+func (a *App) terminal(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Origin") != a.cfg.PublicURL {
+		fail(w, 403, "origin_denied", "Origin tidak diizinkan")
+		return
+	}
+	csrfToken := ""
+	for _, proto := range strings.Split(r.Header.Get("Sec-WebSocket-Protocol"), ",") {
+		proto = strings.TrimSpace(proto)
+		if strings.HasPrefix(proto, "csrf.") {
+			csrfToken = strings.TrimPrefix(proto, "csrf.")
+		}
+	}
+	cookie, err := r.Cookie("panel_session")
+	if err != nil || csrfToken == "" {
+		fail(w, 403, "csrf_failed", "Token CSRF tidak berlaku")
+		return
+	}
+	var csrfHash string
+	if err = a.db.QueryRow("SELECT csrf_hash FROM sessions WHERE token_hash=?", hash(cookie.Value)).Scan(&csrfHash); err != nil || hash(csrfToken) != csrfHash {
+		fail(w, 403, "csrf_failed", "Token CSRF tidak berlaku")
+		return
+	}
+	var host, username, fingerprint, projectPath string
+	var port int
+	var ciphertext, nonce []byte
+	err = a.db.QueryRow(`SELECT v.host,v.port,v.username,v.host_fingerprint,v.password_encrypted,v.password_nonce,p.project_path FROM projects p JOIN vps v ON v.id=p.vps_id WHERE p.id=? AND p.deleted_at IS NULL`, r.PathValue("id")).Scan(&host, &port, &username, &fingerprint, &ciphertext, &nonce, &projectPath)
+	if err != nil || projectPath == "" {
+		fail(w, 404, "not_found", "Folder project VPS tidak ditemukan")
+		return
+	}
+	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{"iploy-terminal"}})
+	if err != nil {
+		return
+	}
+	defer ws.Close(websocket.StatusNormalClosure, "terminal closed")
+	ws.SetReadLimit(64 * 1024)
+	ctx := r.Context()
+	setupError := func(message string) {
+		_ = ws.Write(ctx, websocket.MessageText, []byte("\r\n[terminal] "+message+"\r\n"))
+		_ = ws.Close(websocket.StatusInternalError, "terminal setup failed")
+	}
+	block, err := aes.NewCipher(a.key)
+	if err != nil {
+		setupError("Kredensial VPS tidak dapat dibuka.")
+		return
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		setupError("Kredensial VPS tidak dapat dibuka.")
+		return
+	}
+	password, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		setupError("Kredensial VPS tidak dapat dibuka; periksa master key panel.")
+		return
+	}
+	client, _, err := sshConnect(host, port, username, string(password), fingerprint)
+	if err != nil {
+		setupError("Login SSH gagal. Periksa jaringan, kredensial, atau fingerprint host VPS.")
+		return
+	}
+	defer client.Close()
+	session, err := client.NewSession()
+	if err != nil {
+		setupError("Shell SSH tidak dapat dibuka oleh server.")
+		return
+	}
+	defer session.Close()
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		setupError("Input terminal tidak tersedia.")
+		return
+	}
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		setupError("Output terminal tidak tersedia.")
+		return
+	}
+	if err = session.RequestPty("xterm", 24, 100, ssh.TerminalModes{ssh.ECHO: 1, ssh.TTY_OP_ISPEED: 14400, ssh.TTY_OP_OSPEED: 14400}); err != nil {
+		setupError("VPS tidak mengizinkan terminal interaktif (PTY).")
+		return
+	}
+	_ = session.Setenv("TERM", "xterm")
+	if err = session.Start(remoteProjectPrefix(projectPath) + "exec bash -i"); err != nil {
+		setupError("Shell SSH tidak dapat dijalankan.")
+		return
+	}
+	var writeMu sync.Mutex
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, readErr := stdout.Read(buf)
+			if n > 0 {
+				writeMu.Lock()
+				writeErr := ws.Write(ctx, websocket.MessageText, buf[:n])
+				writeMu.Unlock()
+				if writeErr != nil {
+					return
+				}
+			}
+			if readErr != nil {
+				_ = ws.Close(websocket.StatusNormalClosure, "shell ended")
+				return
+			}
+		}
+	}()
+	for {
+		typ, msg, readErr := ws.Read(ctx)
+		if readErr != nil {
+			return
+		}
+		if typ != websocket.MessageText && typ != websocket.MessageBinary {
+			continue
+		}
+		if strings.HasPrefix(string(msg), "\x00resize:") {
+			parts := strings.Split(strings.TrimPrefix(string(msg), "\x00resize:"), ":")
+			if len(parts) == 2 {
+				cols, colErr := strconv.Atoi(parts[0])
+				rows, rowErr := strconv.Atoi(parts[1])
+				if colErr == nil && rowErr == nil && cols >= 10 && cols <= 500 && rows >= 5 && rows <= 300 {
+					_ = session.WindowChange(rows, cols)
+				}
+			}
+			continue
+		}
+		if _, err = stdin.Write(msg); err != nil {
+			return
+		}
+	}
+}
+func (a *App) vps(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		rows, err := a.db.Query("SELECT id,name,host,port,username,host_fingerprint,status,created_at FROM vps ORDER BY created_at DESC")
+		if err != nil {
+			fail(w, 500, "database_error", "Gagal membaca daftar VPS")
+			return
+		}
+		defer rows.Close()
+		items := []VPS{}
+		for rows.Next() {
+			var item VPS
+			if rows.Scan(&item.ID, &item.Name, &item.Host, &item.Port, &item.Username, &item.Fingerprint, &item.Status, &item.Created) == nil {
+				items = append(items, item)
+			}
+		}
+		write(w, 200, items)
+		return
+	}
+	var input struct {
+		Name        string `json:"name"`
+		Host        string `json:"host"`
+		Port        int    `json:"port"`
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+		Fingerprint string `json:"host_fingerprint"`
+	}
+	if body(r, &input) != nil {
+		fail(w, 400, "validation_error", "Data VPS tidak valid")
+		return
+	}
+	input.Name = strings.TrimSpace(input.Name)
+	input.Host = strings.TrimSpace(input.Host)
+	input.Username = strings.TrimSpace(input.Username)
+	input.Fingerprint = strings.TrimSpace(input.Fingerprint)
+	if input.Port == 0 {
+		input.Port = 22
+	}
+	if input.Name == "" || len(input.Name) > 100 || input.Password == "" {
+		fail(w, 400, "validation_error", "Isi nama VPS dan password SSH")
+		return
+	}
+	seenFingerprint, err := sshLogin(input.Host, input.Port, input.Username, input.Password, input.Fingerprint)
+	if err != nil {
+		fail(w, 400, "ssh_connection_failed", "Login SSH gagal. Periksa host, port, username, password, dan host fingerprint.")
+		return
+	}
+	input.Fingerprint = seenFingerprint
+	ct, nonce, err := a.seal([]byte(input.Password))
+	if err != nil {
+		fail(w, 500, "encryption_error", "Kredensial VPS tidak dapat diamankan")
+		return
+	}
+	item := VPS{ID: randomID(), Name: input.Name, Host: input.Host, Port: input.Port, Username: input.Username, Fingerprint: input.Fingerprint, Status: "connected", Created: now()}
+	_, err = a.db.Exec("INSERT INTO vps(id,name,host,port,username,host_fingerprint,password_encrypted,password_nonce,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", item.ID, item.Name, item.Host, item.Port, item.Username, item.Fingerprint, ct, nonce, item.Status, item.Created, item.Created)
+	if err != nil {
+		fail(w, 409, "conflict", "VPS gagal disimpan")
+		return
+	}
+	write(w, 201, item)
+}
+func (a *App) testVPS(w http.ResponseWriter, r *http.Request) {
+	var host, username, fingerprint string
+	var port int
+	var ciphertext, nonce []byte
+	err := a.db.QueryRow("SELECT host,port,username,host_fingerprint,password_encrypted,password_nonce FROM vps WHERE id=?", r.PathValue("id")).Scan(&host, &port, &username, &fingerprint, &ciphertext, &nonce)
+	if err != nil {
+		fail(w, 404, "not_found", "VPS tidak ditemukan")
+		return
+	}
+	block, err := aes.NewCipher(a.key)
+	if err != nil {
+		fail(w, 500, "encryption_error", "Kredensial VPS tidak dapat dibuka")
+		return
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		fail(w, 500, "encryption_error", "Kredensial VPS tidak dapat dibuka")
+		return
+	}
+	password, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		fail(w, 500, "encryption_error", "Kredensial VPS tidak dapat dibuka")
+		return
+	}
+	if _, err = sshLogin(host, port, username, string(password), fingerprint); err != nil {
+		_, _ = a.db.Exec("UPDATE vps SET status='disconnected',updated_at=? WHERE id=?", now(), r.PathValue("id"))
+		fail(w, 502, "ssh_connection_failed", "Koneksi SSH gagal. Periksa akses jaringan dan kredensial VPS.")
+		return
+	}
+	_, _ = a.db.Exec("UPDATE vps SET status='connected',updated_at=? WHERE id=?", now(), r.PathValue("id"))
+	write(w, 200, map[string]string{"status": "connected"})
+}
 func (a *App) projects(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
-		rows, e := a.db.Query(`SELECT id,name,repo_url,branch,dockerfile_path,build_context,domain,container_port,health_path,health_timeout_seconds,runtime_memory_mb,runtime_cpu_limit,active_deployment_id,container_status,deployment_status,created_at FROM projects WHERE deleted_at IS NULL ORDER BY created_at DESC`)
+		rows, e := a.db.Query(`SELECT id,COALESCE(vps_id,''),project_path,name,repo_url,branch,dockerfile_path,build_context,domain,container_port,health_path,health_timeout_seconds,runtime_memory_mb,runtime_cpu_limit,active_deployment_id,container_status,deployment_status,created_at FROM projects WHERE deleted_at IS NULL ORDER BY created_at DESC`)
 		if e != nil {
 			fail(w, 500, "database_error", "Gagal membaca project")
 			return
@@ -466,7 +882,7 @@ func (a *App) projects(w http.ResponseWriter, r *http.Request) {
 		out := []Project{}
 		for rows.Next() {
 			var p Project
-			if rows.Scan(&p.ID, &p.Name, &p.RepoURL, &p.Branch, &p.Dockerfile, &p.BuildContext, &p.Domain, &p.ContainerPort, &p.HealthPath, &p.HealthTimeout, &p.Memory, &p.CPU, &p.Active, &p.ContainerStatus, &p.DeploymentStatus, &p.Created) == nil {
+			if rows.Scan(&p.ID, &p.VPSID, &p.ProjectPath, &p.Name, &p.RepoURL, &p.Branch, &p.Dockerfile, &p.BuildContext, &p.Domain, &p.ContainerPort, &p.HealthPath, &p.HealthTimeout, &p.Memory, &p.CPU, &p.Active, &p.ContainerStatus, &p.DeploymentStatus, &p.Created) == nil {
 				out = append(out, p)
 			}
 		}
@@ -474,40 +890,28 @@ func (a *App) projects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var p Project
-	if body(r, &p) != nil || strings.TrimSpace(p.Name) == "" || !validRepo(p.RepoURL) || !validDomain(p.Domain) || p.ContainerPort < 1 || p.ContainerPort > 65535 {
-		fail(w, 400, "validation_error", "Periksa nama, repository HTTPS publik, domain, dan port")
+	if body(r, &p) != nil || strings.TrimSpace(p.Name) == "" || len(strings.TrimSpace(p.Name)) > 100 || p.VPSID == "" || !safeVPSProjectPath(p.ProjectPath) {
+		fail(w, 400, "validation_error", "Isi nama project, pilih VPS, dan masukkan nama folder atau path project")
 		return
 	}
-	if p.Branch == "" {
-		p.Branch = "main"
-	}
-	if p.Dockerfile == "" {
-		p.Dockerfile = "Dockerfile"
-	}
-	if p.BuildContext == "" {
-		p.BuildContext = "."
-	}
-	if p.HealthPath == "" {
-		p.HealthPath = "/health"
-	}
-	if !strings.HasPrefix(p.HealthPath, "/") || strings.Contains(p.HealthPath, "..") || !safeRelative(p.Dockerfile) || !safeRelative(p.BuildContext) {
-		fail(w, 400, "validation_error", "Path health atau Dockerfile tidak valid")
+	var exists int
+	if e := a.db.QueryRow("SELECT count(*) FROM vps WHERE id=?", p.VPSID).Scan(&exists); e != nil || exists == 0 {
+		fail(w, 400, "validation_error", "Pilih VPS yang terdaftar")
 		return
 	}
-	if p.HealthTimeout == 0 {
-		p.HealthTimeout = 60
-	}
-	if p.Memory == 0 {
-		p.Memory = 512
-	}
-	if p.CPU == 0 {
-		p.CPU = 1
+	if e := a.checkVPSDirectory(p.VPSID, p.ProjectPath); e != nil {
+		fail(w, 400, "remote_path_unavailable", "Login SSH berhasil, tetapi folder project tidak dapat diakses pada VPS")
+		return
 	}
 	p.ID = randomID()
 	p.Created = now()
-	_, e := a.db.Exec(`INSERT INTO projects(id,name,repo_url,branch,dockerfile_path,build_context,domain,container_port,health_path,health_timeout_seconds,runtime_memory_mb,runtime_cpu_limit,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, p.ID, p.Name, p.RepoURL, p.Branch, p.Dockerfile, p.BuildContext, p.Domain, p.ContainerPort, p.HealthPath, p.HealthTimeout, p.Memory, p.CPU, p.Created, p.Created)
+	p.Domain = "linked-" + p.ID + ".invalid"
+	p.ContainerPort = 0
+	p.ContainerStatus = "connected"
+	p.DeploymentStatus = "linked"
+	_, e := a.db.Exec(`INSERT INTO projects(id,vps_id,project_path,name,repo_url,branch,dockerfile_path,build_context,domain,container_port,health_path,health_timeout_seconds,runtime_memory_mb,runtime_cpu_limit,container_status,deployment_status,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, p.ID, p.VPSID, p.ProjectPath, p.Name, "", "", "", "", p.Domain, p.ContainerPort, "", 0, 0, 0, p.ContainerStatus, p.DeploymentStatus, p.Created, p.Created)
 	if e != nil {
-		fail(w, 409, "conflict", "Domain sudah digunakan atau project gagal disimpan")
+		fail(w, 409, "conflict", "Project gagal disimpan")
 		return
 	}
 	write(w, 201, p)
@@ -524,7 +928,7 @@ func (a *App) project(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
 		var p Project
-		e := a.db.QueryRow(`SELECT id,name,repo_url,branch,dockerfile_path,build_context,domain,container_port,health_path,health_timeout_seconds,runtime_memory_mb,runtime_cpu_limit,active_deployment_id,container_status,deployment_status,created_at FROM projects WHERE id=? AND deleted_at IS NULL`, id).Scan(&p.ID, &p.Name, &p.RepoURL, &p.Branch, &p.Dockerfile, &p.BuildContext, &p.Domain, &p.ContainerPort, &p.HealthPath, &p.HealthTimeout, &p.Memory, &p.CPU, &p.Active, &p.ContainerStatus, &p.DeploymentStatus, &p.Created)
+		e := a.db.QueryRow(`SELECT id,COALESCE(vps_id,''),project_path,name,repo_url,branch,dockerfile_path,build_context,domain,container_port,health_path,health_timeout_seconds,runtime_memory_mb,runtime_cpu_limit,active_deployment_id,container_status,deployment_status,created_at FROM projects WHERE id=? AND deleted_at IS NULL`, id).Scan(&p.ID, &p.VPSID, &p.ProjectPath, &p.Name, &p.RepoURL, &p.Branch, &p.Dockerfile, &p.BuildContext, &p.Domain, &p.ContainerPort, &p.HealthPath, &p.HealthTimeout, &p.Memory, &p.CPU, &p.Active, &p.ContainerStatus, &p.DeploymentStatus, &p.Created)
 		if e != nil {
 			fail(w, 404, "not_found", "Project tidak ditemukan")
 			return
@@ -704,9 +1108,14 @@ func (a *App) deployments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var p Project
-	e := a.db.QueryRow("SELECT id,branch FROM projects WHERE id=? AND deleted_at IS NULL", r.PathValue("id")).Scan(&p.ID, &p.Branch)
+	var projectPath string
+	e := a.db.QueryRow("SELECT id,branch,project_path FROM projects WHERE id=? AND deleted_at IS NULL", r.PathValue("id")).Scan(&p.ID, &p.Branch, &projectPath)
 	if e != nil {
 		fail(w, 404, "not_found", "Project tidak ditemukan")
+		return
+	}
+	if projectPath != "" {
+		fail(w, 409, "manual_project", "Project ini hanya ditautkan ke folder VPS; deployment panel belum tersedia untuknya")
 		return
 	}
 	id := randomID()
